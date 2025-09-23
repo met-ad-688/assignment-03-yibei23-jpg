@@ -14,21 +14,32 @@ format:
     theme: cerulean
     toc: true
     toc-depth: 2
+  docx:
+    toc: true
+    toc-depth: 2
+    output-file: assignment03-yibei23-final.docx
 execute: 
   echo: true
   eval: true
   freeze: auto
 ---
+**GitHub Repository Link:**  
+https://github.com/met-ad-688/assignment-03-yibei23-jpg
+
 ```{python}
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.functions import col, count, expr
 from pyspark.sql.functions import col, when, regexp_replace
+from pyspark.sql.functions import when, col, lower
+from pyspark.sql.functions import col, lower, when, coalesce, lit
+from pyspark.sql.functions import col, trim, length
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
+import os
 
 spark = SparkSession.builder.appName("Assignment03").getOrCreate()
 
@@ -70,8 +81,6 @@ print("Rows retained:", df_clean.count())
 df_filtered = df.filter((col("SALARY_FROM").isNotNull()) & (col("SALARY_FROM") > 0))
 salary_industry = df_filtered.select("NAICS2_NAME", "SALARY_FROM", "EMPLOYMENT_TYPE_NAME").toPandas()
 
-import plotly.express as px
-
 fig1 = px.box(
     salary_industry,
     x="NAICS2_NAME",
@@ -82,8 +91,8 @@ fig1 = px.box(
 )
 
 fig1.update_layout(template="plotly_white", xaxis_tickangle=-45)
-fig1.show()
 fig1.write_image("salary_plot.png")
+fig1
 ```
 ![Salary Box Plot](salary_plot.png){width=80%}
 
@@ -92,123 +101,201 @@ The boxplots show significant differences in salary distribution across industri
 
 # Salary Analysis by ONET Occupation Type (Bubble Chart)
 ```{python}
-import plotly.express as px
-import pyspark.sql.functions as F
-from pyspark.sql.functions import col, count
-
-# Step 1: Filter valid salary and ONET_NAME
-df_filtered = df.filter(
-    (col("SALARY").isNotNull()) & 
-    (col("SALARY") > 0) & 
-    (col("ONET_NAME").isNotNull())
+df_occ = (
+    df_clean
+    .withColumn("Occupation", trim(col("LOT_V6_SPECIALIZED_OCCUPATION_NAME")))
+    .filter(col("Occupation").isNotNull() & (length(col("Occupation")) > 0))
+    .filter(col("Average_Salary").isNotNull() & (col("Average_Salary") > 0) & (col("Average_Salary") < 500000))
 )
 
-# Optional: filter by NAICS if the assignment asks
-# df_filtered = df_filtered.filter(
-#     (col("NAICS_2022_4") == '5182') | 
-#     (col("NAICS_2022_5") == '51821') | 
-#     (col("NAICS_2022_6") == '518210')
-# )
+occ_stats = df_occ.groupBy("Occupation").agg(
+    F.expr("percentile_approx(Average_Salary, 0.5)").alias("Median_Salary"),
+    F.count("*").alias("Job_Postings")
+)
 
-# Step 2: Group by ONET_NAME and compute median salary and job count
-onet_salary = df_filtered.groupBy("ONET_NAME").agg(
-    F.expr("percentile_approx(SALARY, 0.5)").alias("Median_Salary"),
-    count("*").alias("Job_Postings")
-).toPandas()
+top20_pdf = (
+    occ_stats.orderBy(F.desc("Job_Postings")).limit(20)
+    .toPandas()
+)
 
-# Step 3: Optional – only keep top 20 occupations
-top_onet_salary = onet_salary.sort_values("Job_Postings", ascending=False).head(20)
+top20_pdf = top20_pdf.sort_values(["Median_Salary", "Job_Postings"], ascending=[False, False])
 
-# Step 4: Create bubble chart
 fig2 = px.scatter(
-    top_onet_salary,
-    x="ONET_NAME",
+    top20_pdf,
+    x="Occupation",
     y="Median_Salary",
     size="Job_Postings",
     color="Median_Salary",
-    title="Top 20 ONET Occupations by Median Salary and Job Postings",
+    color_continuous_scale="Plasma",
+    title="Top 20 Occupations by Median Salary and Job Postings",
     labels={
-        "ONET_NAME": "Occupation",
+        "Occupation": "Occupation",
         "Median_Salary": "Median Salary ($)",
         "Job_Postings": "Number of Postings"
     }
 )
 
-fig2.update_layout(
-    template="plotly_white",
-    xaxis_tickangle=-45,
-    height=600
-)
-
-# Step 5: Save image (make sure /figs exists or adjust the path)
-fig2.write_image("figs/occupation_type.png")
-
+fig2.update_layout(template="plotly_white", xaxis_tickangle=-45, height=600)
+fig2.update_traces(marker=dict(line=dict(width=0.6, color="rgba(0,0,0,0.35)")))
+fig2.write_image("occupation_type.png")
+fig2
 ```
+![Top 20 Occupations by Median Salary and Job Postings](occupation_type.png){width=80%}
+
+**Analysis**
+Salaries for specialized positions like Enterprise Architect and SAP/Oracle/ERP Consultant are at the highest range, around $120,000 to $160,000, but smaller bubbles indicate fewer job openings. In contrast, salaries for general analyst positions, particularly Data Analyst and Business Analyst (general), are concentrated around $85,000 to $100,000, with larger bubbles indicating greater demand. Therefore, higher levels of specialization lead to higher median salaries and lower hiring volume; while broader positions lead to lower salaries and higher hiring volume.
 
 # Salary by Education Level
 ```{python}
-from pyspark.sql.functions import when
-
-df_edu = df_filtered.withColumn(
-    "EDU_GROUP",
-    when(col("EDUCATION_LEVELS_NAME").rlike("Associate|GED|No Education"), "Associate or Lower")
-    .when(col("EDUCATION_LEVELS_NAME").rlike("Bachelor"), "Bachelor")
-    .when(col("EDUCATION_LEVELS_NAME").rlike("Master"), "Master")
-    .when(col("EDUCATION_LEVELS_NAME").rlike("PhD|Doctorate"), "PhD")
+df_edu = (
+    df_clean
+    .filter(
+        col("Average_Salary").isNotNull() &
+        (col("Average_Salary") > 0) &
+        col("MAX_YEARS_EXPERIENCE").isNotNull()
+    )
+    .withColumn(
+        "EDU_GROUP",
+        when(col("EDUCATION_LEVELS_NAME").rlike("PhD|Doctorate"), "PhD")
+        .when(col("EDUCATION_LEVELS_NAME").rlike("Master"), "Master")
+        .when(col("EDUCATION_LEVELS_NAME").rlike("Bachelor"), "Bachelor")
+        .otherwise("Associate or Lower")
+    )
 )
 
-edu_pd = df_edu.select("MAX_YEARS_EXPERIENCE", "Average_Salary", "EDU_GROUP", "LOT_V6_SPECIALIZED_OCCUPATION_NAME").toPandas()
+edu_pd = (
+    df_edu.select(
+        "MAX_YEARS_EXPERIENCE",
+        "Average_Salary",
+        "EDU_GROUP",
+        "LOT_V6_SPECIALIZED_OCCUPATION_NAME",
+    )
+    .toPandas()
+    .dropna(subset=["MAX_YEARS_EXPERIENCE", "Average_Salary"])
+)
+
+np.random.seed(42)  # reproducible jitter
+edu_pd["exp_jitter"] = (
+    edu_pd["MAX_YEARS_EXPERIENCE"].astype(float) + np.random.uniform(-0.25, 0.25, len(edu_pd))
+)
 
 fig3 = px.scatter(
     edu_pd,
-    x="MAX_YEARS_EXPERIENCE",
+    x="exp_jitter",
     y="Average_Salary",
     color="EDU_GROUP",
     hover_name="LOT_V6_SPECIALIZED_OCCUPATION_NAME",
     title="Experience vs Salary by Education Level",
-    labels={"MAX_YEARS_EXPERIENCE":"Years of Experience", "Average_Salary":"Salary ($)"}
+    labels={
+        "exp_jitter": "Years of Experience (jittered)",
+        "Average_Salary": "Salary ($)",
+        "EDU_GROUP": "Education Level",
+    },
+    template="plotly_white",
 )
-
-fig3.update_traces(marker=dict(size=8, opacity=0.7))
-fig3.show()
+fig3.update_traces(marker=dict(size=7, opacity=0.7))
+fig3.update_yaxes(tickformat="$,.0f")
 fig3.write_image("EDUCATION_LEVEL.png")
+fig3
 ```
+![Experience vs Salary by Education Level](EDUCATION_LEVEL.png){width=80%}
+
+**Analysis**
+The scatter plot shows that salaries increase with experience, but there are significant differences across education levels. Salaries for those with bachelor's and master's degrees are more concentrated in the $50,000 to $200,000 range, while salaries for associate's degrees and below are less outliers, but still reach extremely high levels. So while higher education provides consistency, experience and specialized positions can sometimes be more important than formal education in salary outcomes.
 
 # Salary by Remote Work Type
 ```{python}
-df_remote = df_filtered.withColumn(
-    "REMOTE_GROUP",
-    when(col("REMOTE_TYPE_NAME") == "Remote", "Remote")
-    .when(col("REMOTE_TYPE_NAME") == "Hybrid", "Hybrid")
-    .otherwise("Onsite")
+assert "df_clean" in globals(), "df_clean is not defined."
+
+possible_remote_cols = [
+    "REMOTE_TYPE_NAME", "REMOTE_TYPE", "WORKPLACE_TYPE", "WORK_LOCATION",
+    "JOB_WORK_TYPE", "WORK_MODEL", "REMOTE_WORK_TYPE"
+]
+remote_cols = [c for c in possible_remote_cols if c in df_clean.columns]
+
+remote_text = (
+    lower(coalesce(*[col(c) for c in remote_cols]))  # first existing col among the list
+    if remote_cols else lit(None).cast("string")
 )
 
-remote_pd = df_remote.select("MAX_YEARS_EXPERIENCE", "Average_Salary", "LOT_V6_SPECIALIZED_OCCUPATION_NAME", "REMOTE_GROUP").toPandas()
+df_remote = (
+    df_clean
+    .filter(
+        col("Average_Salary").isNotNull() &
+        (col("Average_Salary") > 0) &
+        (col("Average_Salary") < 500_000) &  # trim extreme outliers for cleaner plots
+        col("MAX_YEARS_EXPERIENCE").isNotNull()
+    )
+    .withColumn("REMOTE_SOURCE", remote_text)
+    .withColumn(
+        "REMOTE_GROUP",
+        # Put HYBRID FIRST so phrases like "hybrid remote" don't get captured by "remote" rule
+        when(remote_text.rlike(r"hyb|part[- ]?remote|flex|split|mix|blended|some.*remote|both.*(office|onsite).*remote"), "Hybrid")
+        .when(remote_text.rlike(r"remote|work[- ]?from[- ]?home|wfh|tele[- ]?work|telecommute"), "Remote")
+        .when(remote_text.rlike(r"on[- ]?site|in[- ]?person|on[- ]?prem|in[- ]?office|office"), "Onsite")
+        .otherwise("Onsite")  # default bucket if nothing is stated
+    )
+)
 
-# Scatter
-fig4 = px.scatter(
+print("Remote group counts:")
+df_remote.groupBy("REMOTE_GROUP").count().orderBy(F.desc("count")).show()
+
+print("Top distinct values found in the remote text column (to see how it's written):")
+(df_remote.groupBy("REMOTE_SOURCE")
+ .count()
+ .orderBy(F.desc("count"))
+ .show(20, truncate=False))
+
+remote_pd = (df_remote
+             .select("MAX_YEARS_EXPERIENCE", "Average_Salary",
+                     "LOT_V6_SPECIALIZED_OCCUPATION_NAME", "REMOTE_GROUP")
+             .toPandas()
+             .dropna(subset=["MAX_YEARS_EXPERIENCE", "Average_Salary"]))
+
+np.random.seed(7)
+remote_pd["exp_jitter"] = remote_pd["MAX_YEARS_EXPERIENCE"].astype(float) + np.random.uniform(-0.3, 0.3, len(remote_pd))
+
+fig_scatter = px.scatter(
     remote_pd,
-    x="MAX_YEARS_EXPERIENCE",
+    x="exp_jitter",
     y="Average_Salary",
     color="REMOTE_GROUP",
     hover_name="LOT_V6_SPECIALIZED_OCCUPATION_NAME",
-    title="Experience vs Salary by Remote Work Type"
+    title="Experience vs Salary by Remote Work Type",
+    labels={"exp_jitter": "Years of Experience (jittered)", "Average_Salary": "Salary ($)", "REMOTE_GROUP": "Remote Type"},
+    category_orders={"REMOTE_GROUP": ["Remote", "Hybrid", "Onsite"]},
 )
-fig4.show()
-fig4.write_image("Remote_scatter.png")
+fig_scatter.update_traces(marker=dict(size=7, opacity=0.7, line=dict(width=0.5, color="rgba(0,0,0,0.3)")))
+fig_scatter.update_xaxes(showline=True, linewidth=1, linecolor="#999", gridcolor="#e6e6e6")
+fig_scatter.update_yaxes(showline=True, linewidth=1, linecolor="#999", gridcolor="#e6e6e6", tickformat="$,.0f")
+fig_scatter.update_layout(margin=dict(l=60, r=20, t=60, b=60), legend_title_text="Remote Type")
+fig_scatter
+fig_scatter.write_image("Remote_scatter.png")  
 
-# Histograms
-fig5 = px.histogram(
+fig_hist = px.histogram(
     remote_pd,
     x="Average_Salary",
     color="REMOTE_GROUP",
+    nbins=40,
     barmode="overlay",
-    title="Salary Distribution by Remote Type"
+    opacity=0.55,
+    title="Salary Distribution by Remote Type",
+    labels={"Average_Salary": "Salary ($)", "REMOTE_GROUP": "Remote Type"},
+    category_orders={"REMOTE_GROUP": ["Remote", "Hybrid", "Onsite"]},
 )
-fig5.show()
-fig4.write_image("Remote_his.png")
+fig_hist.update_traces(marker_line_width=0.5, marker_line_color="rgba(0,0,0,0.2)")
+fig_hist.update_xaxes(showline=True, linewidth=1, linecolor="#999", gridcolor="#e6e6e6", tickformat="$,.0f")
+fig_hist.update_yaxes(showline=True, linewidth=1, linecolor="#999", gridcolor="#e6e6e6")
+fig_hist.update_layout(margin=dict(l=60, r=20, t=60, b=60), legend_title_text="Remote Type")
+fig_hist
+fig_hist.write_image("Remote_hist.png")       
 ```
+![Experience vs Salary by Remote Work Type](Remote_scatter.png){width=80%}
+![Salary Distribution by Remote Type](Remote_hist.png){width=80%}
 
+**Analysis**
+Salary Distribution by Remote Type:
+Remote and on-site positions have very similar salary distributions, roughly clustered between $90,000 and $160,000. On-site positions have the most salary distribution and a wider range, while hybrid positions have much less.
 
-
-
+Experience and Salary by Remote Job Type:
+Salary increases slightly with experience across all three job types. Salary ranges for remote/on-site positions roughly overlap, and there's no significant salary premium for purely remote positions. Hybrid positions have less salary distribution, but when it does exist, it falls in the same range as the other two job types.
